@@ -13,8 +13,14 @@ app.use(express.json());
 const PORT = process.env.PORT || 5000;
 const API_KEY = process.env.API_KEY;
 
-const validCallStatuses = ["answered", "not_answered", "completed"];
+// Allowed call statuses
+const validCallStatuses = [
+    "answered",
+    "not_answered",
+    "completed"
+];
 
+// Allowed borrower intents
 const validIntents = [
     "agree_to_pay",
     "promise_to_pay",
@@ -29,11 +35,11 @@ const validIntents = [
     "other"
 ];
 
-// API authentication
+// API authentication middleware
 function authenticate(req, res, next) {
-    const key = req.headers["x-api-key"];
+    const providedKey = req.headers["x-api-key"];
 
-    if (!API_KEY || key !== API_KEY) {
+    if (!API_KEY || providedKey !== API_KEY) {
         return res.status(401).json({
             success: false,
             message: "Unauthorized access"
@@ -42,48 +48,6 @@ function authenticate(req, res, next) {
 
     next();
 }
-
-// Update borrower payment status after authorized verification
-app.patch("/api/borrowers/:borrowerId/payment-status", authenticate, (req, res) => {
-    const { paymentStatus } = req.body || {};
-    const borrowerId = req.params.borrowerId;
-
-    const allowedStatuses = ["Overdue", "Paid"];
-
-    if (!allowedStatuses.includes(paymentStatus)) {
-        return res.status(400).json({
-            success: false,
-            message: "Invalid payment status"
-        });
-    }
-
-    db.run(
-        "UPDATE borrowers SET paymentStatus = ? WHERE borrowerId = ?",
-        [paymentStatus, borrowerId],
-        function (err) {
-            if (err) {
-                return res.status(500).json({
-                    success: false,
-                    message: "Database error"
-                });
-            }
-
-            if (this.changes === 0) {
-                return res.status(404).json({
-                    success: false,
-                    message: "Borrower not found"
-                });
-            }
-
-            res.json({
-                success: true,
-                message: "Payment status updated successfully",
-                borrowerId,
-                paymentStatus
-            });
-        }
-    );
-});
 
 // Health check
 app.get("/api/health", (req, res) => {
@@ -95,56 +59,138 @@ app.get("/api/health", (req, res) => {
 
 // Fetch borrower details
 app.get("/api/borrowers/:borrowerId", authenticate, (req, res) => {
-    const borrowerId = req.params.borrowerId.trim();
+    const borrowerId = req.params.borrowerId;
 
-    if (!borrowerId) {
-        return res.status(400).json({
-            success: false,
-            message: "Borrower ID is required"
-        });
-    }
+    db.get(
+        "SELECT * FROM borrowers WHERE borrowerId = ?",
+        [borrowerId],
+        (err, borrower) => {
+            if (err) {
+                return res.status(500).json({
+                    success: false,
+                    message: "Database error"
+                });
+            }
 
-    const sql = `
-        SELECT borrowerId, name, emiAmount, dueDate, paymentStatus
-        FROM borrowers
-        WHERE borrowerId = ?
-    `;
+            if (!borrower) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Borrower not found"
+                });
+            }
 
-    db.get(sql, [borrowerId], (err, borrower) => {
-        if (err) {
-            return res.status(500).json({
-                success: false,
-                message: "Database error"
+            res.json({
+                success: true,
+                data: borrower
             });
         }
-
-        if (!borrower) {
-            return res.status(404).json({
-                success: false,
-                message: "Borrower not found"
-            });
-        }
-
-        res.json({
-            success: true,
-            data: borrower
-        });
-    });
+    );
 });
+
+// Update borrower payment status
+app.patch(
+    "/api/borrowers/:borrowerId/payment-status",
+    authenticate,
+    (req, res) => {
+        const borrowerId = req.params.borrowerId;
+        const { paymentStatus } = req.body;
+
+        if (!paymentStatus || typeof paymentStatus !== "string") {
+            return res.status(400).json({
+                success: false,
+                message: "Valid payment status is required"
+            });
+        }
+
+        db.run(
+            "UPDATE borrowers SET paymentStatus = ? WHERE borrowerId = ?",
+            [paymentStatus, borrowerId],
+            function (err) {
+                if (err) {
+                    return res.status(500).json({
+                        success: false,
+                        message: "Database error"
+                    });
+                }
+
+                if (this.changes === 0) {
+                    return res.status(404).json({
+                        success: false,
+                        message: "Borrower not found"
+                    });
+                }
+
+                res.json({
+                    success: true,
+                    message: "Payment status updated successfully"
+                });
+            }
+        );
+    }
+);
 
 // Save call outcome
 app.post("/api/call-outcomes", authenticate, (req, res) => {
-    const {
-        borrowerId,
-        callStatus,
-        borrowerIntent,
-        paymentCommitmentDate,
-        paymentCommitmentAmount,
-        callbackDateTime,
-        humanAssistanceRequired
-    } = req.body || {};
+    const body = req.body || {};
+    const data = body.data || body;
 
-    // Required field validation
+    const borrowerId =
+        data.borrowerId ||
+        data.borrowerID ||
+        data.borrower_id;
+
+    const callStatus =
+        data.callStatus ||
+        data.call_status;
+
+    const borrowerIntent =
+        data.borrowerIntent ||
+        data.disposition ||
+        data.DISPOSITION;
+
+    const paymentCommitmentDate =
+        data.paymentCommitmentDate ||
+        data.payment_commitment_date ||
+        null;
+
+    const rawAmount =
+        data.paymentCommitmentAmount ??
+        data.payment_commitment_amount ??
+        null;
+
+    const callbackDateTime =
+        data.callbackDateTime ||
+        data.callbackDatetime ||
+        data.callback_datetime ||
+        null;
+
+    const humanAssistanceRequired =
+        data.humanAssistanceRequired ??
+        data.human_assistance_required ??
+        false;
+
+    // Convert amount such as "5,000 rupees" into a number
+    let paymentCommitmentAmount = null;
+
+    if (rawAmount !== null && rawAmount !== "") {
+        if (typeof rawAmount === "number") {
+            paymentCommitmentAmount = rawAmount;
+        } else {
+            const cleanedAmount = String(rawAmount).replace(/,/g, "");
+            const match = cleanedAmount.match(/\d+(\.\d+)?/);
+
+            if (!match) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid payment commitment amount"
+                });
+            }
+
+            paymentCommitmentAmount = Number(match[0]);
+        }
+    }
+
+    // Validate required fields
     if (
         typeof borrowerId !== "string" ||
         !borrowerId.trim() ||
@@ -153,11 +199,11 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
     ) {
         return res.status(400).json({
             success: false,
-            message: "Borrower ID, call status and intent are required"
+            message: "Borrower ID, call status and intent are required",
+            receivedFields: Object.keys(data)
         });
     }
 
-    // Validate call status
     if (!validCallStatuses.includes(callStatus)) {
         return res.status(400).json({
             success: false,
@@ -165,7 +211,6 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
         });
     }
 
-    // Validate borrower intent
     if (!validIntents.includes(borrowerIntent)) {
         return res.status(400).json({
             success: false,
@@ -173,34 +218,29 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
         });
     }
 
-    // Validate payment amount
     if (
-        paymentCommitmentAmount !== undefined &&
         paymentCommitmentAmount !== null &&
-        (
-            typeof paymentCommitmentAmount !== "number" ||
-            !Number.isFinite(paymentCommitmentAmount) ||
-            paymentCommitmentAmount <= 0
-        )
+        (!Number.isFinite(paymentCommitmentAmount) ||
+            paymentCommitmentAmount <= 0)
     ) {
         return res.status(400).json({
             success: false,
-            message: "Payment commitment amount must be a positive number"
+            message: "Payment amount must be positive"
         });
     }
 
-    // Validate human assistance field
     if (
-        humanAssistanceRequired !== undefined &&
-        typeof humanAssistanceRequired !== "boolean"
+        typeof humanAssistanceRequired !== "boolean" &&
+        humanAssistanceRequired !== 0 &&
+        humanAssistanceRequired !== 1
     ) {
         return res.status(400).json({
             success: false,
-            message: "Human assistance field must be true or false"
+            message: "Human assistance must be true or false"
         });
     }
 
-    // Check whether borrower exists
+    // Verify borrower exists
     db.get(
         "SELECT borrowerId FROM borrowers WHERE borrowerId = ?",
         [borrowerId.trim()],
@@ -221,9 +261,13 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
 
             const sql = `
                 INSERT INTO call_outcomes (
-                    borrowerId, callStatus, borrowerIntent,
-                    paymentCommitmentDate, paymentCommitmentAmount,
-                    callbackDateTime, humanAssistanceRequired
+                    borrowerId,
+                    callStatus,
+                    borrowerIntent,
+                    paymentCommitmentDate,
+                    paymentCommitmentAmount,
+                    callbackDateTime,
+                    humanAssistanceRequired
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `;
@@ -232,9 +276,9 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
                 borrowerId.trim(),
                 callStatus,
                 borrowerIntent,
-                paymentCommitmentDate || null,
-                paymentCommitmentAmount ?? null,
-                callbackDateTime || null,
+                paymentCommitmentDate,
+                paymentCommitmentAmount,
+                callbackDateTime,
                 humanAssistanceRequired ? 1 : 0
             ];
 
@@ -254,10 +298,12 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
                         borrowerId: borrowerId.trim(),
                         callStatus,
                         borrowerIntent,
-                        paymentCommitmentDate: paymentCommitmentDate || null,
-                        paymentCommitmentAmount: paymentCommitmentAmount ?? null,
-                        callbackDateTime: callbackDateTime || null,
-                        humanAssistanceRequired: Boolean(humanAssistanceRequired)
+                        paymentCommitmentDate,
+                        paymentCommitmentAmount,
+                        callbackDateTime,
+                        humanAssistanceRequired: Boolean(
+                            humanAssistanceRequired
+                        )
                     }
                 });
             });
@@ -265,7 +311,7 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
     );
 });
 
-// View saved outcomes
+// Fetch saved call outcomes
 app.get("/api/call-outcomes", authenticate, (req, res) => {
     db.all(
         "SELECT * FROM call_outcomes ORDER BY id DESC",
@@ -280,6 +326,7 @@ app.get("/api/call-outcomes", authenticate, (req, res) => {
 
             res.json({
                 success: true,
+                count: outcomes.length,
                 data: outcomes
             });
         }
@@ -287,11 +334,14 @@ app.get("/api/call-outcomes", authenticate, (req, res) => {
 });
 
 // Start server after database initialization
-ready.then(() => {
-    app.listen(PORT, () => {
-        console.log("SmartEMI database connected successfully!");
-        console.log(`SmartEMI API running on port ${PORT}`);
+ready
+    .then(() => {
+        app.listen(PORT, () => {
+            console.log("SmartEMI database connected successfully!");
+            console.log(`SmartEMI API running on port ${PORT}`);
+        });
+    })
+    .catch((err) => {
+        console.error("Database initialization failed:", err);
+        process.exit(1);
     });
-}).catch((err) => {
-    console.error("Database initialization failed:", err);
-});
