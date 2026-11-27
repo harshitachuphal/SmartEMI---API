@@ -8,12 +8,11 @@ const { db, ready } = require("./database");
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 5000;
 const API_KEY = process.env.API_KEY;
 
-// Allowed call statuses
 const validCallStatuses = [
     "answered",
     "not_answered",
@@ -21,10 +20,10 @@ const validCallStatuses = [
     "unknown"
 ];
 
-// Allowed borrower intents
 const validIntents = [
     "agree_to_pay",
     "promise_to_pay",
+    "payment_commitment",
     "needs_more_time",
     "financial_difficulty",
     "already_paid",
@@ -33,10 +32,11 @@ const validIntents = [
     "busy",
     "dispute",
     "no_account",
+    "human_escalation",
+    "no_response",
     "other"
 ];
 
-// API authentication middleware
 function authenticate(req, res, next) {
     const providedKey = req.headers["x-api-key"];
 
@@ -50,6 +50,91 @@ function authenticate(req, res, next) {
     next();
 }
 
+function firstValue(...values) {
+    return values.find(
+        (value) =>
+            value !== undefined &&
+            value !== null &&
+            String(value).trim() !== ""
+    );
+}
+
+function normalizeCallStatus(value) {
+    const status = String(value || "unknown")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, "_");
+
+    const aliases = {
+        na: "unknown",
+        answered: "answered",
+        completed: "completed",
+        complete: "completed",
+        not_answered: "not_answered",
+        unanswered: "not_answered",
+        no_answer: "not_answered",
+        no_response: "not_answered",
+        disconnected: "unknown",
+        failed: "unknown"
+    };
+
+    return aliases[status] || "unknown";
+}
+
+function normalizeIntent(value) {
+    const intent = String(value || "other")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, "_");
+
+    const aliases = {
+        payment_commitment: "promise_to_pay",
+        agree_to_pay: "promise_to_pay",
+        promise_to_pay: "promise_to_pay",
+        need_more_time: "needs_more_time",
+        callback: "callback_later",
+        human_escalation: "human_escalation",
+        no_response: "no_response"
+    };
+
+    return aliases[intent] || intent;
+}
+
+function parseAmount(value) {
+    if (value === undefined || value === null || value === "") {
+        return null;
+    }
+
+    const cleaned = String(value).replace(/,/g, "");
+    const match = cleaned.match(/\d+(\.\d+)?/);
+
+    if (!match) return null;
+
+    const amount = Number(match[0]);
+
+    return Number.isFinite(amount) && amount > 0
+        ? amount
+        : null;
+}
+
+function parseBoolean(value) {
+    if (value === true || value === 1) return true;
+
+    const normalized = String(value).trim().toLowerCase();
+
+    return ["true", "1", "yes", "required"].includes(normalized);
+}
+
+function cleanText(value) {
+    if (value === undefined || value === null) return null;
+
+    const text = String(value).trim();
+
+    if (!text || text.toLowerCase() === "null") return null;
+
+    return text;
+}
+
 // Health check
 app.get("/api/health", (req, res) => {
     res.json({
@@ -60,13 +145,13 @@ app.get("/api/health", (req, res) => {
 
 // Fetch borrower details
 app.get("/api/borrowers/:borrowerId", authenticate, (req, res) => {
-    const borrowerId = req.params.borrowerId;
-
     db.get(
         "SELECT * FROM borrowers WHERE borrowerId = ?",
-        [borrowerId],
+        [req.params.borrowerId],
         (err, borrower) => {
             if (err) {
+                console.error("Borrower fetch error:", err);
+
                 return res.status(500).json({
                     success: false,
                     message: "Database error"
@@ -88,15 +173,14 @@ app.get("/api/borrowers/:borrowerId", authenticate, (req, res) => {
     );
 });
 
-// Update borrower payment status
+// Update payment status only when verified by a trusted process.
 app.patch(
     "/api/borrowers/:borrowerId/payment-status",
     authenticate,
     (req, res) => {
-        const borrowerId = req.params.borrowerId;
-        const { paymentStatus } = req.body;
+        const paymentStatus = cleanText(req.body?.paymentStatus);
 
-        if (!paymentStatus || typeof paymentStatus !== "string") {
+        if (!paymentStatus) {
             return res.status(400).json({
                 success: false,
                 message: "Valid payment status is required"
@@ -105,7 +189,7 @@ app.patch(
 
         db.run(
             "UPDATE borrowers SET paymentStatus = ? WHERE borrowerId = ?",
-            [paymentStatus, borrowerId],
+            [paymentStatus, req.params.borrowerId],
             function (err) {
                 if (err) {
                     return res.status(500).json({
@@ -130,13 +214,8 @@ app.patch(
     }
 );
 
-// Save call outcome from Inya post-call payload
+// Save Inya post-call outcome
 app.post("/api/call-outcomes", authenticate, (req, res) => {
-    console.log(
-        "POST CALL OUTCOME PAYLOAD:",
-        JSON.stringify(req.body)
-    );
-
     const body = req.body || {};
 
     const extraction =
@@ -149,94 +228,75 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
 
     const userContext = body.user_context || {};
 
-    // Borrower ID comes from call context, not from the borrower
-    const borrowerId =
-        body.borrowerId ||
-        body.borrowerID ||
-        body.borrower_id ||
-        userContext.borrowerId ||
-        userContext.borrowerID ||
-        extraction.borrower_id;
+    const borrowerId = firstValue(
+        body.borrowerId,
+        body.borrowerID,
+        body.borrower_id,
+        userContext.borrowerId,
+        userContext.borrowerID,
+        extraction.borrower_id
+    );
 
-    const rawCallStatus =
-        extraction.call_status ||
-        body.callStatus ||
-        body.call_status ||
-        body.call_infra?.call_status?.callStatus ||
-        "unknown";
+    const conversationId = cleanText(firstValue(
+        body.conversation_id,
+        body.conversationId,
+        body.call_infra?.conversation_id
+    ));
 
-    const callStatus = String(rawCallStatus).toLowerCase();
+    const callStatus = normalizeCallStatus(firstValue(
+        extraction.call_status,
+        body.callStatus,
+        body.call_status,
+        body.call_infra?.call_status?.callStatus
+    ));
 
-    const borrowerIntent =
-        extraction.DISPOSITION ||
-        extraction.disposition ||
-        body.borrowerIntent ||
-        body.borrower_intent ||
-        "other";
+    const borrowerIntent = normalizeIntent(firstValue(
+        extraction.DISPOSITION,
+        extraction.disposition,
+        body.borrowerIntent,
+        body.borrower_intent
+    ));
 
-    const paymentCommitmentDate =
-        extraction.payment_commitment_date ||
-        extraction.paymentCommitmentDate ||
-        null;
+    const paymentCommitmentDate = cleanText(firstValue(
+        extraction.payment_commitment_date,
+        extraction.paymentCommitmentDate
+    ));
 
-    const rawAmount =
-        extraction.payment_commitment_amount ??
-        extraction.paymentCommitmentAmount ??
-        null;
+    const paymentCommitmentAmount = parseAmount(firstValue(
+        extraction.payment_commitment_amount,
+        extraction.paymentCommitmentAmount
+    ));
 
-    let paymentCommitmentAmount = null;
+    const callbackDateTime = cleanText(firstValue(
+        extraction.callback_datetime,
+        extraction.callbackDateTime
+    ));
 
-    if (rawAmount !== null && rawAmount !== "") {
-        const cleanedAmount = String(rawAmount).replace(/,/g, "");
-        const match = cleanedAmount.match(/\d+(\.\d+)?/);
+    const reasonForDelay = cleanText(firstValue(
+        extraction.reason_for_delay,
+        extraction.reasonForDelay
+    ));
 
-        if (!match) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid payment commitment amount"
-            });
-        }
+    const emiAmountDiscussed = cleanText(firstValue(
+        extraction.emi_amount_discussed,
+        extraction.emiAmountDiscussed
+    ));
 
-        paymentCommitmentAmount = Number(match[0]);
+    const rawHumanAssistance = firstValue(
+        extraction.human_assistance_required,
+        extraction.humanAssistanceRequired,
+        false
+    );
 
-        if (
-            !Number.isFinite(paymentCommitmentAmount) ||
-            paymentCommitmentAmount <= 0
-        ) {
-            return res.status(400).json({
-                success: false,
-                message: "Payment amount must be positive"
-            });
-        }
-    }
+    const humanAssistanceRequired = parseBoolean(rawHumanAssistance);
 
-    const callbackDateTime =
-        extraction.callback_datetime ||
-        extraction.callbackDateTime ||
-        null;
-
-    const rawHumanAssistance =
-        extraction.human_assistance_required ??
-        extraction.humanAssistanceRequired ??
-        false;
-
-    const humanAssistanceRequired =
-        rawHumanAssistance === true ||
-        rawHumanAssistance === 1 ||
-        String(rawHumanAssistance).toLowerCase() === "true";
-
-    // Validate required borrower ID
-    if (
-        typeof borrowerId !== "string" ||
-        !borrowerId.trim()
-    ) {
+    if (!borrowerId || typeof borrowerId !== "string") {
         return res.status(400).json({
             success: false,
             message: "Borrower ID is missing from call context"
         });
     }
 
-    // Validate call status
     if (!validCallStatuses.includes(callStatus)) {
         return res.status(400).json({
             success: false,
@@ -245,7 +305,6 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
         });
     }
 
-    // Validate intent
     if (!validIntents.includes(borrowerIntent)) {
         return res.status(400).json({
             success: false,
@@ -254,7 +313,6 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
         });
     }
 
-    // Verify borrower exists
     db.get(
         "SELECT borrowerId FROM borrowers WHERE borrowerId = ?",
         [borrowerId.trim()],
@@ -274,16 +332,19 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
             }
 
             const sql = `
-                INSERT INTO call_outcomes (
+                INSERT OR IGNORE INTO call_outcomes (
                     borrowerId,
                     callStatus,
                     borrowerIntent,
                     paymentCommitmentDate,
                     paymentCommitmentAmount,
                     callbackDateTime,
-                    humanAssistanceRequired
+                    humanAssistanceRequired,
+                    reasonForDelay,
+                    emiAmountDiscussed,
+                    conversationId
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `;
 
             const values = [
@@ -293,7 +354,10 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
                 paymentCommitmentDate,
                 paymentCommitmentAmount,
                 callbackDateTime,
-                humanAssistanceRequired ? 1 : 0
+                humanAssistanceRequired ? 1 : 0,
+                reasonForDelay,
+                emiAmountDiscussed,
+                conversationId
             ];
 
             db.run(sql, values, function (err) {
@@ -306,23 +370,47 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
                     });
                 }
 
-                console.log(
-                    "CALL OUTCOME SAVED:",
-                    this.lastID
-                );
+                // Existing conversation ID means webhook was already processed.
+                if (this.changes === 0 && conversationId) {
+                    return db.get(
+                        "SELECT * FROM call_outcomes WHERE conversationId = ?",
+                        [conversationId],
+                        (findError, existing) => {
+                            if (findError) {
+                                return res.status(500).json({
+                                    success: false,
+                                    message: "Could not retrieve existing outcome"
+                                });
+                            }
+
+                            return res.status(200).json({
+                                success: true,
+                                duplicate: true,
+                                message: "This conversation was already saved",
+                                data: existing
+                            });
+                        }
+                    );
+                }
+
+                const savedId = this.lastID;
 
                 return res.status(201).json({
                     success: true,
+                    duplicate: false,
                     message: "Call outcome saved successfully",
                     data: {
-                        id: this.lastID,
+                        id: savedId,
                         borrowerId: borrowerId.trim(),
+                        conversationId,
                         callStatus,
                         borrowerIntent,
                         paymentCommitmentDate,
                         paymentCommitmentAmount,
                         callbackDateTime,
-                        humanAssistanceRequired
+                        humanAssistanceRequired,
+                        reasonForDelay,
+                        emiAmountDiscussed
                     }
                 });
             });
