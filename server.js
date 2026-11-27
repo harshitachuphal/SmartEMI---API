@@ -17,7 +17,8 @@ const API_KEY = process.env.API_KEY;
 const validCallStatuses = [
     "answered",
     "not_answered",
-    "completed"
+    "completed",
+    "unknown"
 ];
 
 // Allowed borrower intents
@@ -129,115 +130,127 @@ app.patch(
     }
 );
 
-// Save call outcome
+// Save call outcome from Inya post-call payload
 app.post("/api/call-outcomes", authenticate, (req, res) => {
-    console.log("POST CALL OUTCOME PAYLOAD:", JSON.stringify(req.body));
+    console.log(
+        "POST CALL OUTCOME PAYLOAD:",
+        JSON.stringify(req.body)
+    );
+
     const body = req.body || {};
-    const data = body.data || body;
 
+    const extraction =
+        body.post_call_extraction_v2 ||
+        body.disposition_result ||
+        body.data?.post_call_extraction_v2 ||
+        body.data?.disposition_result ||
+        body.data ||
+        {};
+
+    const userContext = body.user_context || {};
+
+    // Borrower ID comes from call context, not from the borrower
     const borrowerId =
-        data.borrowerId ||
-        data.borrowerID ||
-        data.borrower_id;
+        body.borrowerId ||
+        body.borrowerID ||
+        body.borrower_id ||
+        userContext.borrowerId ||
+        userContext.borrowerID ||
+        extraction.borrower_id;
 
-    const callStatus =
-        data.callStatus ||
-        data.call_status;
+    const rawCallStatus =
+        extraction.call_status ||
+        body.callStatus ||
+        body.call_status ||
+        body.call_infra?.call_status?.callStatus ||
+        "unknown";
+
+    const callStatus = String(rawCallStatus).toLowerCase();
 
     const borrowerIntent =
-        data.borrowerIntent ||
-        data.disposition ||
-        data.DISPOSITION;
+        extraction.DISPOSITION ||
+        extraction.disposition ||
+        body.borrowerIntent ||
+        body.borrower_intent ||
+        "other";
 
     const paymentCommitmentDate =
-        data.paymentCommitmentDate ||
-        data.payment_commitment_date ||
+        extraction.payment_commitment_date ||
+        extraction.paymentCommitmentDate ||
         null;
 
     const rawAmount =
-        data.paymentCommitmentAmount ??
-        data.payment_commitment_amount ??
+        extraction.payment_commitment_amount ??
+        extraction.paymentCommitmentAmount ??
         null;
 
-    const callbackDateTime =
-        data.callbackDateTime ||
-        data.callbackDatetime ||
-        data.callback_datetime ||
-        null;
-
-    const humanAssistanceRequired =
-        data.humanAssistanceRequired ??
-        data.human_assistance_required ??
-        false;
-
-    // Convert amount such as "5,000 rupees" into a number
     let paymentCommitmentAmount = null;
 
     if (rawAmount !== null && rawAmount !== "") {
-        if (typeof rawAmount === "number") {
-            paymentCommitmentAmount = rawAmount;
-        } else {
-            const cleanedAmount = String(rawAmount).replace(/,/g, "");
-            const match = cleanedAmount.match(/\d+(\.\d+)?/);
+        const cleanedAmount = String(rawAmount).replace(/,/g, "");
+        const match = cleanedAmount.match(/\d+(\.\d+)?/);
 
-            if (!match) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid payment commitment amount"
-                });
-            }
+        if (!match) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid payment commitment amount"
+            });
+        }
 
-            paymentCommitmentAmount = Number(match[0]);
+        paymentCommitmentAmount = Number(match[0]);
+
+        if (
+            !Number.isFinite(paymentCommitmentAmount) ||
+            paymentCommitmentAmount <= 0
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Payment amount must be positive"
+            });
         }
     }
 
-    // Validate required fields
+    const callbackDateTime =
+        extraction.callback_datetime ||
+        extraction.callbackDateTime ||
+        null;
+
+    const rawHumanAssistance =
+        extraction.human_assistance_required ??
+        extraction.humanAssistanceRequired ??
+        false;
+
+    const humanAssistanceRequired =
+        rawHumanAssistance === true ||
+        rawHumanAssistance === 1 ||
+        String(rawHumanAssistance).toLowerCase() === "true";
+
+    // Validate required borrower ID
     if (
         typeof borrowerId !== "string" ||
-        !borrowerId.trim() ||
-        !callStatus ||
-        !borrowerIntent
+        !borrowerId.trim()
     ) {
         return res.status(400).json({
             success: false,
-            message: "Borrower ID, call status and intent are required",
-            receivedFields: Object.keys(data)
+            message: "Borrower ID is missing from call context"
         });
     }
 
+    // Validate call status
     if (!validCallStatuses.includes(callStatus)) {
         return res.status(400).json({
             success: false,
-            message: "Invalid call status"
+            message: "Invalid call status",
+            received: callStatus
         });
     }
 
+    // Validate intent
     if (!validIntents.includes(borrowerIntent)) {
         return res.status(400).json({
             success: false,
-            message: "Invalid borrower intent"
-        });
-    }
-
-    if (
-        paymentCommitmentAmount !== null &&
-        (!Number.isFinite(paymentCommitmentAmount) ||
-            paymentCommitmentAmount <= 0)
-    ) {
-        return res.status(400).json({
-            success: false,
-            message: "Payment amount must be positive"
-        });
-    }
-
-    if (
-        typeof humanAssistanceRequired !== "boolean" &&
-        humanAssistanceRequired !== 0 &&
-        humanAssistanceRequired !== 1
-    ) {
-        return res.status(400).json({
-            success: false,
-            message: "Human assistance must be true or false"
+            message: "Invalid borrower intent",
+            received: borrowerIntent
         });
     }
 
@@ -285,13 +298,20 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
 
             db.run(sql, values, function (err) {
                 if (err) {
+                    console.error("Call outcome save error:", err);
+
                     return res.status(500).json({
                         success: false,
                         message: "Could not save call outcome"
                     });
                 }
 
-                res.status(201).json({
+                console.log(
+                    "CALL OUTCOME SAVED:",
+                    this.lastID
+                );
+
+                return res.status(201).json({
                     success: true,
                     message: "Call outcome saved successfully",
                     data: {
@@ -302,9 +322,7 @@ app.post("/api/call-outcomes", authenticate, (req, res) => {
                         paymentCommitmentDate,
                         paymentCommitmentAmount,
                         callbackDateTime,
-                        humanAssistanceRequired: Boolean(
-                            humanAssistanceRequired
-                        )
+                        humanAssistanceRequired
                     }
                 });
             });
