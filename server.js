@@ -131,6 +131,7 @@ app.patch(
 
 // Save call outcome
 app.post("/api/call-outcomes", authenticate, (req, res) => {
+    console.log("POST CALL OUTCOME PAYLOAD:", JSON.stringify(req.body));
     const body = req.body || {};
     const data = body.data || body;
 
